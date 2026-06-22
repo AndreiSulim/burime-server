@@ -48,6 +48,11 @@ function tryMatchPlayers() {
   const roomId = generateRoomId();
   const theme = getRandomTheme();
 
+  // Сохраняем имена для быстрого доступа
+  const playerNames = {};
+  playerNames[player1.id] = player1.name;
+  playerNames[player2.id] = player2.name;
+
   const gameData = {
     players: [player1, player2],
     currentTurn: player1.id,
@@ -60,16 +65,18 @@ function tryMatchPlayers() {
     isActive: true,
     interval: null,
     roundCount: 1,
-    playerNames: {
-      [player1.id]: player1.name,
-      [player2.id]: player2.name
+    playerNames: playerNames,
+    playerSockets: {
+      [player1.id]: player1.socket,
+      [player2.id]: player2.socket
     },
     createdAt: Date.now()
   };
 
   activeGames.set(roomId, gameData);
-  console.log(`✅ Игра создана: ${roomId}, игроки: ${player1.name} и ${player2.name}`);
-  console.log(`📋 Всего активных игр: ${activeGames.size}`);
+  console.log(`✅ Игра создана: ${roomId}`);
+  console.log(`   👤 Игрок 1: ${player1.name} (${player1.id})`);
+  console.log(`   👤 Игрок 2: ${player2.name} (${player2.id})`);
 
   // Подключаем игроков к комнате Socket.io
   player1.socket.join(roomId);
@@ -182,7 +189,8 @@ function sendGameState(roomId) {
 
   game.players.forEach(player => {
     const opponent = game.players.find(p => p.id !== player.id);
-    player.socket.emit('game_state', {
+    // Отправляем состояние текущему игроку
+    io.to(player.id).emit('game_state', {
       myId: player.id,
       opponentId: opponent ? opponent.id : null,
       myName: player.name,
@@ -262,8 +270,7 @@ function finishGame(roomId) {
     rounds: game.round
   });
 
-  // ⚠️ НЕ УДАЛЯЕМ ИГРУ, ЧТОБЫ ИГРОКИ МОГЛИ ПРОСМАТРИВАТЬ РЕЗУЛЬТАТ
-  console.log(`🏁 Игра ${roomId} завершена, но сохранена в памяти`);
+  console.log(`🏁 Игра ${roomId} завершена, сохранена в памяти`);
 }
 
 // =============================================
@@ -295,33 +302,47 @@ io.on('connection', (socket) => {
     tryMatchPlayers();
   });
 
-  // ---- ВХОД В КОМНАТУ ----
+  // ---- ВХОД В КОМНАТУ (исправленная версия) ----
   socket.on('join_game', (data) => {
     const { roomId, name } = data;
-    console.log(`👤 Игрок ${name} (${socket.id}) подключается к комнате ${roomId}`);
+    console.log(`👤 Попытка подключения: ${name} (${socket.id}) к комнате ${roomId}`);
 
-    // Проверяем, существует ли игра
     const game = activeGames.get(roomId);
     if (!game) {
-      console.log(`❌ Игра ${roomId} не найдена в активных играх`);
-      console.log(`📋 Активные игры: ${Array.from(activeGames.keys()).join(', ')}`);
+      console.log(`❌ Игра ${roomId} не найдена`);
       socket.emit('error', 'Игра не найдена');
       return;
     }
 
-    // Проверяем, является ли игрок участником
-    const player = game.players.find(p => p.id === socket.id);
+    // 🔥 НОВАЯ ЛОГИКА: ищем игрока по ИМЕНИ, а не по socket.id
+    const player = game.players.find(p => p.name === name);
+    
     if (!player) {
-      console.log(`❌ Игрок ${socket.id} не участник игры ${roomId}`);
+      console.log(`❌ Игрок с именем "${name}" не найден в игре ${roomId}`);
+      console.log(`   Участники игры: ${game.players.map(p => p.name).join(', ')}`);
       socket.emit('error', 'Вы не участник этой игры');
       return;
     }
 
-    socket.join(roomId);
-    console.log(`✅ Игрок ${name} подключился к игре ${roomId}`);
+    // Обновляем socket.id для этого игрока (новое соединение)
+    const oldId = player.id;
+    player.id = socket.id;
+    player.socket = socket;
+    
+    // Обновляем маппинг сокетов
+    game.playerSockets[oldId] = socket;
+    delete game.playerSockets[oldId];
+    game.playerSockets[socket.id] = socket;
 
-    // Отправляем полное состояние игры
+    console.log(`✅ Игрок ${name} обновил соединение (старый ID: ${oldId}, новый ID: ${socket.id})`);
+
+    // Подключаем сокет к комнате
+    socket.join(roomId);
+
+    // Находим оппонента
     const opponent = game.players.find(p => p.id !== socket.id);
+
+    // Отправляем состояние игры этому игроку
     socket.emit('game_state', {
       myId: socket.id,
       opponentId: opponent ? opponent.id : null,
@@ -407,7 +428,6 @@ io.on('connection', (socket) => {
       waitingQueue.splice(queueIndex, 1);
     }
 
-    // Проверяем все активные игры
     for (const [roomId, game] of activeGames) {
       const playerInGame = game.players.some(p => p.id === socket.id);
       if (playerInGame) {
@@ -419,7 +439,6 @@ io.on('connection', (socket) => {
         if (game.interval) {
           clearInterval(game.interval);
         }
-        // ❌ НЕ УДАЛЯЕМ ИГРУ, ЧТОБЫ ДРУГОЙ ИГРОК МОГ ВИДЕТЬ СОСТОЯНИЕ
         break;
       }
     }
