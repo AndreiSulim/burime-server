@@ -69,12 +69,13 @@ function tryMatchPlayers() {
 
   activeGames.set(roomId, gameData);
   console.log(`✅ Игра создана: ${roomId}, игроки: ${player1.name} и ${player2.name}`);
+  console.log(`📋 Всего активных игр: ${activeGames.size}`);
 
   // Подключаем игроков к комнате Socket.io
   player1.socket.join(roomId);
   player2.socket.join(roomId);
 
-  // Отправляем событие о начале игры (для перехода на игровой экран)
+  // Отправляем событие о начале игры
   io.to(roomId).emit('game_started', {
     roomId: roomId,
     opponent: player2.name,
@@ -168,7 +169,6 @@ function handleTurnTimeout(roomId) {
     playerName: currentPlayer ? currentPlayer.name : 'Игрок'
   });
 
-  // Отправляем обновленное состояние
   sendGameState(roomId);
 }
 
@@ -262,18 +262,8 @@ function finishGame(roomId) {
     rounds: game.round
   });
 
-  // ❌ УДАЛЯЕМ ИГРУ СРАЗУ, ЧТОБЫ НЕ ЗАСОРЯТЬ ПАМЯТЬ
-  // Но даём игрокам время прочитать финал
-  setTimeout(() => {
-    const gameToDelete = activeGames.get(roomId);
-    if (gameToDelete) {
-      gameToDelete.players.forEach(p => {
-        p.socket.leave(roomId);
-      });
-      activeGames.delete(roomId);
-      console.log(`🗑️ Игра ${roomId} удалена`);
-    }
-  }, 30000); // 30 секунд на чтение финала
+  // ⚠️ НЕ УДАЛЯЕМ ИГРУ, ЧТОБЫ ИГРОКИ МОГЛИ ПРОСМАТРИВАТЬ РЕЗУЛЬТАТ
+  console.log(`🏁 Игра ${roomId} завершена, но сохранена в памяти`);
 }
 
 // =============================================
@@ -310,14 +300,16 @@ io.on('connection', (socket) => {
     const { roomId, name } = data;
     console.log(`👤 Игрок ${name} (${socket.id}) подключается к комнате ${roomId}`);
 
+    // Проверяем, существует ли игра
     const game = activeGames.get(roomId);
     if (!game) {
-      console.log(`❌ Игра ${roomId} не найдена`);
+      console.log(`❌ Игра ${roomId} не найдена в активных играх`);
+      console.log(`📋 Активные игры: ${Array.from(activeGames.keys()).join(', ')}`);
       socket.emit('error', 'Игра не найдена');
       return;
     }
 
-    // Проверяем, есть ли игрок в этой комнате
+    // Проверяем, является ли игрок участником
     const player = game.players.find(p => p.id === socket.id);
     if (!player) {
       console.log(`❌ Игрок ${socket.id} не участник игры ${roomId}`);
@@ -328,7 +320,7 @@ io.on('connection', (socket) => {
     socket.join(roomId);
     console.log(`✅ Игрок ${name} подключился к игре ${roomId}`);
 
-    // Отправляем состояние игры
+    // Отправляем полное состояние игры
     const opponent = game.players.find(p => p.id !== socket.id);
     socket.emit('game_state', {
       myId: socket.id,
@@ -353,6 +345,8 @@ io.on('connection', (socket) => {
       timeLeft: game.timeLeft,
       turnTimeLeft: game.turnTimeLeft
     });
+
+    console.log(`📤 Отправлено состояние игры для ${name}`);
   });
 
   // ---- ОТПРАВКА СТРОКИ ----
@@ -413,9 +407,11 @@ io.on('connection', (socket) => {
       waitingQueue.splice(queueIndex, 1);
     }
 
+    // Проверяем все активные игры
     for (const [roomId, game] of activeGames) {
       const playerInGame = game.players.some(p => p.id === socket.id);
       if (playerInGame) {
+        console.log(`🚪 Игрок ${socket.id} вышел из игры ${roomId}`);
         io.to(roomId).emit('opponent_left', {
           message: 'Соперник покинул игру'
         });
@@ -423,9 +419,7 @@ io.on('connection', (socket) => {
         if (game.interval) {
           clearInterval(game.interval);
         }
-        // Удаляем игру сразу, чтобы не ждать
-        activeGames.delete(roomId);
-        console.log(`🗑️ Игра ${roomId} удалена (игрок вышел)`);
+        // ❌ НЕ УДАЛЯЕМ ИГРУ, ЧТОБЫ ДРУГОЙ ИГРОК МОГ ВИДЕТЬ СОСТОЯНИЕ
         break;
       }
     }
@@ -440,5 +434,4 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🚀 Сервер запущен на порту ${PORT}`);
   console.log(`👥 Ожидаем игроков...`);
-  console.log(`📋 Активных игр: ${activeGames.size}`);
 });
