@@ -7,7 +7,7 @@ const app = express();
 
 // ✅ РАСШИРЕННЫЕ НАСТРОЙКИ CORS
 app.use(cors({
-  origin: "*", // Разрешаем запросы с любых сайтов
+  origin: "*",
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true
@@ -15,7 +15,6 @@ app.use(cors({
 
 app.use(express.json());
 
-// ✅ ДОПОЛНИТЕЛЬНЫЕ ЗАГОЛОВКИ ДЛЯ ВСЕХ ОТВЕТОВ
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -28,14 +27,13 @@ app.use((req, res, next) => {
 
 const server = http.createServer(app);
 
-// ✅ НАСТРОЙКИ SOCKET.IO С ПРАВИЛЬНЫМ CORS
 const io = new Server(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true,
-    transports: ['websocket', 'polling'] // Поддерживаем оба транспорта
+    transports: ['websocket', 'polling']
   },
   allowEIO3: true
 });
@@ -106,9 +104,11 @@ function tryMatchPlayers() {
   console.log(`   👤 Игрок 2: ${player2.name} (${player2.id})`);
   console.log(`   🎯 Начинает: ${firstPlayer.name}`);
 
+  // Подключаем игроков к комнате
   player1.socket.join(roomId);
   player2.socket.join(roomId);
 
+  // Отправляем событие о начале игры
   io.to(roomId).emit('game_started', {
     roomId: roomId,
     opponent: player2.name,
@@ -127,51 +127,80 @@ function tryMatchPlayers() {
     youAre: firstPlayer === player1 ? 'player2' : 'player1'
   });
 
+  // ✅ ЗАПУСКАЕМ ИГРОВОЙ ЦИКЛ СРАЗУ
   startGameLoop(roomId);
 
+  // ✅ ОТПРАВЛЯЕМ СОСТОЯНИЕ ЧЕРЕЗ 1 СЕКУНДУ (после подключения)
   setTimeout(() => {
-    sendGameState(roomId);
-    io.to(roomId).emit('turn_changed', {
-      currentTurn: firstPlayer.id,
-      turnTimeLeft: 10
-    });
+    const game = activeGames.get(roomId);
+    if (game && game.isActive) {
+      sendGameState(roomId);
+      io.to(roomId).emit('turn_changed', {
+        currentTurn: game.currentTurn,
+        turnTimeLeft: game.turnTimeLeft
+      });
+      console.log(`📤 Начальное состояние отправлено для ${roomId}`);
+    }
   }, 1000);
 
   return true;
 }
 
 // =============================================
-// ИГРОВОЙ ЦИКЛ
+// ИГРОВОЙ ЦИКЛ (С ТАЙМЕРОМ)
 // =============================================
 
 function startGameLoop(roomId) {
   const game = activeGames.get(roomId);
-  if (!game) return;
-
-  if (game.interval) {
-    clearInterval(game.interval);
+  if (!game) {
+    console.log(`❌ Игра ${roomId} не найдена при запуске цикла`);
+    return;
   }
 
+  // Останавливаем старый интервал, если был
+  if (game.interval) {
+    clearInterval(game.interval);
+    game.interval = null;
+  }
+
+  console.log(`⏳ Запуск игрового цикла для ${roomId}`);
+
   game.interval = setInterval(() => {
-    if (!game.isActive) {
+    const currentGame = activeGames.get(roomId);
+    
+    // Проверяем, существует ли игра
+    if (!currentGame) {
+      console.log(`❌ Игра ${roomId} удалена, останавливаем цикл`);
       clearInterval(game.interval);
       return;
     }
 
-    game.timeLeft--;
-    game.turnTimeLeft--;
+    // Проверяем, активна ли игра
+    if (!currentGame.isActive) {
+      console.log(`⏸️ Игра ${roomId} неактивна, останавливаем цикл`);
+      clearInterval(currentGame.interval);
+      currentGame.interval = null;
+      return;
+    }
 
+    // Обновляем таймеры
+    currentGame.timeLeft--;
+    currentGame.turnTimeLeft--;
+
+    // Отправляем тик всем в комнате
     io.to(roomId).emit('game_tick', {
-      timeLeft: game.timeLeft,
-      turnTimeLeft: game.turnTimeLeft,
-      currentTurn: game.currentTurn
+      timeLeft: currentGame.timeLeft,
+      turnTimeLeft: currentGame.turnTimeLeft,
+      currentTurn: currentGame.currentTurn
     });
 
-    if (game.turnTimeLeft <= 0) {
+    // Проверка: истекло ли время хода (10 секунд)
+    if (currentGame.turnTimeLeft <= 0) {
       handleTurnTimeout(roomId);
     }
 
-    if (game.timeLeft <= 0) {
+    // Проверка: истекло ли время раунда (3 минуты)
+    if (currentGame.timeLeft <= 0) {
       handleRoundEnd(roomId);
     }
 
@@ -280,6 +309,8 @@ function handleRoundEnd(roomId) {
     currentTurn: game.currentTurn,
     turnTimeLeft: game.turnTimeLeft
   });
+  
+  // ✅ ПЕРЕЗАПУСКАЕМ ЦИКЛ
   startGameLoop(roomId);
 }
 
@@ -408,14 +439,24 @@ io.on('connection', (socket) => {
 
   socket.on('submit_line', (data) => {
     const { roomId, text } = data;
+    console.log(`📝 Попытка отправки строки в ${roomId}: "${text}"`);
+    
     const game = activeGames.get(roomId);
 
-    if (!game || !game.isActive) {
-      socket.emit('error', 'Игра не найдена или завершена');
+    if (!game) {
+      console.log(`❌ Игра ${roomId} не найдена`);
+      socket.emit('error', 'Игра не найдена');
+      return;
+    }
+
+    if (!game.isActive) {
+      console.log(`❌ Игра ${roomId} неактивна (isActive=${game.isActive})`);
+      socket.emit('error', 'Игра завершена');
       return;
     }
 
     if (socket.id !== game.currentTurn) {
+      console.log(`❌ Сейчас не твой ход. Твой ID: ${socket.id}, currentTurn: ${game.currentTurn}`);
       socket.emit('error', 'Сейчас не твой ход');
       return;
     }
@@ -453,7 +494,8 @@ io.on('connection', (socket) => {
       turnTimeLeft: game.turnTimeLeft
     });
 
-    console.log(`📝 ${player.name}: "${text}"`);
+    console.log(`✅ ${player.name}: "${text}"`);
+    console.log(`🔄 Ход передан ${opponent.name}`);
   });
 
   socket.on('disconnect', () => {
@@ -474,6 +516,7 @@ io.on('connection', (socket) => {
         game.isActive = false;
         if (game.interval) {
           clearInterval(game.interval);
+          game.interval = null;
         }
         break;
       }
