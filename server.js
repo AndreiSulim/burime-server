@@ -16,7 +16,7 @@ const io = new Server(server, {
 });
 
 // =============================================
-// ХРАНЕНИЕ ДАННЫХ В ПАМЯТИ СЕРВЕРА
+// ХРАНЕНИЕ ДАННЫХ
 // =============================================
 
 const waitingQueue = [];
@@ -36,7 +36,7 @@ function getRandomTheme() {
 }
 
 // =============================================
-// ПОИСК СОПЕРНИКА (Матчмейкинг)
+// ПОИСК СОПЕРНИКА
 // =============================================
 
 function tryMatchPlayers() {
@@ -48,14 +48,15 @@ function tryMatchPlayers() {
   const roomId = generateRoomId();
   const theme = getRandomTheme();
 
-  // Сохраняем имена для быстрого доступа
-  const playerNames = {};
-  playerNames[player1.id] = player1.name;
-  playerNames[player2.id] = player2.name;
+  // 🎲 ГЛАВНОЕ ИЗМЕНЕНИЕ: случайный выбор первого хода
+  const firstPlayer = Math.random() < 0.5 ? player1 : player2;
+  const secondPlayer = firstPlayer === player1 ? player2 : player1;
+
+  console.log(`🎲 Первый ход: ${firstPlayer.name}`);
 
   const gameData = {
     players: [player1, player2],
-    currentTurn: player1.id,
+    currentTurn: firstPlayer.id, // ← случайный игрок начинает
     round: 1,
     timeLeft: 180,
     turnTimeLeft: 10,
@@ -64,8 +65,10 @@ function tryMatchPlayers() {
     theme: theme,
     isActive: true,
     interval: null,
-    roundCount: 1,
-    playerNames: playerNames,
+    playerNames: {
+      [player1.id]: player1.name,
+      [player2.id]: player2.name
+    },
     playerSockets: {
       [player1.id]: player1.socket,
       [player2.id]: player2.socket
@@ -77,8 +80,9 @@ function tryMatchPlayers() {
   console.log(`✅ Игра создана: ${roomId}`);
   console.log(`   👤 Игрок 1: ${player1.name} (${player1.id})`);
   console.log(`   👤 Игрок 2: ${player2.name} (${player2.id})`);
+  console.log(`   🎯 Начинает: ${firstPlayer.name}`);
 
-  // Подключаем игроков к комнате Socket.io
+  // Подключаем игроков к комнате
   player1.socket.join(roomId);
   player2.socket.join(roomId);
 
@@ -88,21 +92,28 @@ function tryMatchPlayers() {
     opponent: player2.name,
     theme: theme,
     round: 1,
-    currentTurn: player1.id,
-    youAre: 'player1'
+    currentTurn: firstPlayer.id,
+    youAre: firstPlayer === player1 ? 'player1' : 'player2'
   });
 
-  io.to(player2.socket.id).emit('game_started', {
+  // Отправляем второму игроку
+  const secondPlayerRole = firstPlayer === player1 ? 'player2' : 'player1';
+  io.to(secondPlayer.socket.id).emit('game_started', {
     roomId: roomId,
-    opponent: player1.name,
+    opponent: firstPlayer.name,
     theme: theme,
     round: 1,
-    currentTurn: player1.id,
-    youAre: 'player2'
+    currentTurn: firstPlayer.id,
+    youAre: secondPlayerRole
   });
 
   // Запускаем игровой цикл
   startGameLoop(roomId);
+
+  // Отправляем начальное состояние
+  setTimeout(() => {
+    sendGameState(roomId);
+  }, 500);
 
   return true;
 }
@@ -189,7 +200,6 @@ function sendGameState(roomId) {
 
   game.players.forEach(player => {
     const opponent = game.players.find(p => p.id !== player.id);
-    // Отправляем состояние текущему игроку
     io.to(player.id).emit('game_state', {
       myId: player.id,
       opponentId: opponent ? opponent.id : null,
@@ -225,6 +235,7 @@ function handleRoundEnd(roomId) {
   game.turnTimeLeft = 10;
   game.lastLine = null;
 
+  // Меняем первого ходящего в новом раунде
   const firstPlayer = game.round % 2 === 0 ? game.players[0] : game.players[1];
   game.currentTurn = firstPlayer.id;
 
@@ -270,7 +281,7 @@ function finishGame(roomId) {
     rounds: game.round
   });
 
-  console.log(`🏁 Игра ${roomId} завершена, сохранена в памяти`);
+  console.log(`🏁 Игра ${roomId} завершена`);
 }
 
 // =============================================
@@ -302,7 +313,7 @@ io.on('connection', (socket) => {
     tryMatchPlayers();
   });
 
-  // ---- ВХОД В КОМНАТУ (исправленная версия) ----
+  // ---- ВХОД В КОМНАТУ ----
   socket.on('join_game', (data) => {
     const { roomId, name } = data;
     console.log(`👤 Попытка подключения: ${name} (${socket.id}) к комнате ${roomId}`);
@@ -314,35 +325,31 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // 🔥 НОВАЯ ЛОГИКА: ищем игрока по ИМЕНИ, а не по socket.id
+    // Ищем игрока по имени
     const player = game.players.find(p => p.name === name);
     
     if (!player) {
-      console.log(`❌ Игрок с именем "${name}" не найден в игре ${roomId}`);
-      console.log(`   Участники игры: ${game.players.map(p => p.name).join(', ')}`);
+      console.log(`❌ Игрок с именем "${name}" не найден`);
       socket.emit('error', 'Вы не участник этой игры');
       return;
     }
 
-    // Обновляем socket.id для этого игрока (новое соединение)
+    // Обновляем socket.id для этого игрока
     const oldId = player.id;
     player.id = socket.id;
     player.socket = socket;
     
-    // Обновляем маппинг сокетов
     game.playerSockets[oldId] = socket;
     delete game.playerSockets[oldId];
     game.playerSockets[socket.id] = socket;
 
-    console.log(`✅ Игрок ${name} обновил соединение (старый ID: ${oldId}, новый ID: ${socket.id})`);
+    console.log(`✅ Игрок ${name} обновил соединение (старый ID: ${oldId})`);
 
-    // Подключаем сокет к комнате
     socket.join(roomId);
 
-    // Находим оппонента
     const opponent = game.players.find(p => p.id !== socket.id);
 
-    // Отправляем состояние игры этому игроку
+    // Отправляем состояние
     socket.emit('game_state', {
       myId: socket.id,
       opponentId: opponent ? opponent.id : null,
@@ -358,7 +365,6 @@ io.on('connection', (socket) => {
       }
     });
 
-    // Отправляем тему и раунд
     socket.emit('round_start', {
       round: game.round,
       theme: game.theme,
@@ -367,7 +373,8 @@ io.on('connection', (socket) => {
       turnTimeLeft: game.turnTimeLeft
     });
 
-    console.log(`📤 Отправлено состояние игры для ${name}`);
+    console.log(`📤 Отправлено состояние для ${name}`);
+    console.log(`   🎯 Текущий ход: ${game.currentTurn === socket.id ? 'ТВОЙ' : 'СОПЕРНИКА'}`);
   });
 
   // ---- ОТПРАВКА СТРОКИ ----
@@ -376,7 +383,7 @@ io.on('connection', (socket) => {
     const game = activeGames.get(roomId);
 
     if (!game || !game.isActive) {
-      socket.emit('error', 'Игра не найдена или уже завершена');
+      socket.emit('error', 'Игра не найдена или завершена');
       return;
     }
 
@@ -417,6 +424,8 @@ io.on('connection', (socket) => {
       currentTurn: game.currentTurn,
       turnTimeLeft: game.turnTimeLeft
     });
+
+    console.log(`📝 ${player.name}: "${text}"`);
   });
 
   // ---- ОТКЛЮЧЕНИЕ ----
@@ -431,7 +440,7 @@ io.on('connection', (socket) => {
     for (const [roomId, game] of activeGames) {
       const playerInGame = game.players.some(p => p.id === socket.id);
       if (playerInGame) {
-        console.log(`🚪 Игрок ${socket.id} вышел из игры ${roomId}`);
+        console.log(`🚪 Игрок вышел из игры ${roomId}`);
         io.to(roomId).emit('opponent_left', {
           message: 'Соперник покинул игру'
         });
