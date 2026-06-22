@@ -1,465 +1,348 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const cors = require('cors');
+// =============================================
+// ПОЛУЧАЕМ ДАННЫЕ ИЗ URL
+// =============================================
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+const params = new URLSearchParams(window.location.search);
+const roomId = params.get('room');
+const playerName = params.get('name');
+const SERVER_URL = params.get('server');
 
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
+if (!roomId || !playerName || !SERVER_URL) {
+    alert('Ошибка: не хватает данных для подключения к игре');
+    window.location.href = '/';
+}
+
+// =============================================
+// ПОДКЛЮЧЕНИЕ К СЕРВЕРУ
+// =============================================
+
+const socket = io(SERVER_URL);
+let myId = null;
+let opponentId = null;
+let myHistory = [];
+let fullHistory = [];
+let isMyTurn = false;
+let gameState = null;
+
+// =============================================
+// DOM-ЭЛЕМЕНТЫ
+// =============================================
+
+const opponentLine = document.getElementById('opponentLine');
+const memoryHint = document.getElementById('memoryHint');
+const lineInput = document.getElementById('lineInput');
+const sendBtn = document.getElementById('sendBtn');
+const turnIndicator = document.getElementById('turnIndicator');
+const roundTimer = document.getElementById('roundTimer');
+const turnTimer = document.getElementById('turnTimer');
+const roundBadge = document.getElementById('roundBadge');
+const themeDisplay = document.getElementById('themeDisplay');
+const myNameSpan = document.getElementById('myName');
+const opponentNameSpan = document.getElementById('opponentName');
+const arena = document.getElementById('arena');
+const finalScreen = document.getElementById('finalScreen');
+const poemBox = document.getElementById('poemBox');
+const playAgainBtn = document.getElementById('playAgainBtn');
+
+// =============================================
+// ФУНКЦИЯ ОБНОВЛЕНИЯ ХОДА (ГЛАВНАЯ)
+// =============================================
+
+function updateTurn(myId, currentTurn) {
+    isMyTurn = (currentTurn === myId);
+    console.log(`🔄 Обновление хода: currentTurn=${currentTurn}, myId=${myId}, isMyTurn=${isMyTurn}`);
+    
+    if (isMyTurn) {
+        turnIndicator.textContent = '🎯 Твой ход! Пиши!';
+        turnIndicator.className = 'turn-indicator your-turn';
+        lineInput.disabled = false;
+        lineInput.className = 'active';
+        sendBtn.disabled = false;
+        lineInput.focus();
+    } else {
+        turnIndicator.textContent = '⏳ Ход соперника...';
+        turnIndicator.className = 'turn-indicator opponent-turn';
+        lineInput.disabled = true;
+        lineInput.className = '';
+        sendBtn.disabled = true;
+    }
+}
+
+// =============================================
+// СОЕДИНЕНИЕ С СЕРВЕРОМ
+// =============================================
+
+socket.on('connect', () => {
+    console.log('✅ Подключен к серверу игры');
+    myId = socket.id;
+    console.log('📤 Отправляем join_game для комнаты:', roomId);
+    socket.emit('join_game', { roomId, name: playerName });
 });
 
 // =============================================
-// ХРАНЕНИЕ ДАННЫХ
+// ОБРАБОТКА СОБЫТИЙ ОТ СЕРВЕРА
 // =============================================
 
-const waitingQueue = [];
-const activeGames = new Map();
+// 1. Получение состояния игры
+socket.on('game_state', (data) => {
+    console.log('📦 Получено состояние игры:', data);
+    
+    myId = data.myId;
+    opponentId = data.opponentId;
+    myNameSpan.textContent = data.myName;
+    opponentNameSpan.textContent = data.opponentName;
+    
+    gameState = data.state;
+    
+    if (data.state.history) {
+        fullHistory = data.state.history;
+        myHistory = data.state.history
+            .filter(line => line.authorId === myId)
+            .map(line => line.text);
+        updateMemoryHint();
+    }
+    
+    if (data.state.lastLine) {
+        opponentLine.textContent = data.state.lastLine;
+        opponentLine.className = 'opponent-line';
+    }
+    
+    updateTimers({
+        timeLeft: data.state.timeLeft,
+        turnTimeLeft: data.state.turnTimeLeft
+    });
+    
+    // 🔥 ОБНОВЛЯЕМ ХОД СРАЗУ
+    updateTurn(myId, data.state.currentTurn);
+});
+
+// 2. Смена хода (ОСНОВНОЕ СОБЫТИЕ)
+socket.on('turn_changed', (data) => {
+    console.log('🔄 Смена хода:', data);
+    updateTurn(myId, data.currentTurn);
+    updateTimers({ turnTimeLeft: data.turnTimeLeft });
+});
+
+// 3. Обновление таймеров
+socket.on('game_tick', (data) => {
+    updateTimers(data);
+});
+
+// 4. Новая строка
+socket.on('new_line', (data) => {
+    console.log('📝 Новая строка от', data.author, ':', data.lastLine);
+    
+    fullHistory.push({
+        text: data.lastLine,
+        author: data.author,
+        authorId: data.authorId,
+        timestamp: Date.now()
+    });
+    
+    if (data.authorId === myId) {
+        myHistory.push(data.lastLine);
+        updateMemoryHint();
+    }
+    
+    opponentLine.textContent = data.lastLine;
+    opponentLine.className = 'opponent-line';
+    
+    updateTurn(myId, data.currentTurn);
+    updateTimers({ turnTimeLeft: data.turnTimeLeft });
+});
+
+// 5. Пропуск хода
+socket.on('turn_skipped', (data) => {
+    console.log('⏭️ Пропуск хода:', data);
+    fullHistory.push({
+        text: `... (${data.playerName} пропустил ход) ...`,
+        author: 'system',
+        authorId: 'system',
+        isSkip: true
+    });
+    showNotification(`⏭️ ${data.playerName} пропустил ход`);
+    
+    updateTurn(myId, data.currentTurn);
+    updateTimers({ turnTimeLeft: data.turnTimeLeft });
+});
+
+// 6. Начало раунда
+socket.on('round_start', (data) => {
+    console.log('🔄 Начало раунда', data.round, 'Тема:', data.theme);
+    
+    roundBadge.textContent = `Раунд ${data.round}/3`;
+    themeDisplay.textContent = `Тема: ${data.theme}`;
+    opponentLine.textContent = 'Новый раунд! Начинайте...';
+    opponentLine.className = 'opponent-line waiting';
+    myHistory = [];
+    updateMemoryHint();
+    
+    updateTurn(myId, data.currentTurn);
+    updateTimers({
+        timeLeft: data.timeLeft,
+        turnTimeLeft: data.turnTimeLeft
+    });
+    
+    showNotification(`🔄 Раунд ${data.round}! Тема: ${data.theme}`);
+});
+
+// 7. Завершение игры
+socket.on('game_finished', (data) => {
+    console.log('🏁 Игра завершена!');
+    showFinalScreen(data);
+});
+
+// 8. Соперник вышел
+socket.on('opponent_left', (data) => {
+    console.log('🚪 Соперник покинул игру');
+    showNotification('🚪 Соперник покинул игру');
+    lineInput.disabled = true;
+    sendBtn.disabled = true;
+    turnIndicator.textContent = '❌ Игра прервана';
+    turnIndicator.className = 'turn-indicator';
+});
+
+// 9. Ошибки
+socket.on('error', (data) => {
+    console.error('❌ Ошибка от сервера:', data);
+    showNotification(`❌ ${data}`);
+});
+
+// 10. Ошибка подключения
+socket.on('connect_error', (err) => {
+    console.error('❌ Ошибка подключения к серверу:', err);
+    showNotification('❌ Не удалось подключиться к серверу');
+});
+
+// =============================================
+// ОБНОВЛЕНИЕ ИНТЕРФЕЙСА
+// =============================================
+
+function updateTimers(data) {
+    if (data.timeLeft !== undefined) {
+        const minutes = Math.floor(data.timeLeft / 60);
+        const seconds = data.timeLeft % 60;
+        roundTimer.textContent = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+        if (data.timeLeft < 30) {
+            roundTimer.className = 'value danger';
+        } else if (data.timeLeft < 60) {
+            roundTimer.className = 'value warning';
+        } else {
+            roundTimer.className = 'value';
+        }
+    }
+    if (data.turnTimeLeft !== undefined) {
+        turnTimer.textContent = data.turnTimeLeft;
+        if (data.turnTimeLeft < 4) {
+            turnTimer.className = 'value danger';
+        } else if (data.turnTimeLeft < 7) {
+            turnTimer.className = 'value warning';
+        } else {
+            turnTimer.className = 'value';
+        }
+    }
+}
+
+function updateMemoryHint() {
+    if (myHistory.length === 0) {
+        memoryHint.textContent = 'Твои последние: (пока ничего)';
+        return;
+    }
+    const lastThree = myHistory.slice(-3);
+    memoryHint.textContent = `📝 Твои последние: ${lastThree.join(' ... ')}`;
+}
+
+// =============================================
+// ОТПРАВКА СТРОКИ
+// =============================================
+
+function sendLine() {
+    const text = lineInput.value.trim();
+    if (!text) {
+        showNotification('✏️ Напиши что-нибудь!');
+        return;
+    }
+    if (!isMyTurn) {
+        showNotification('⏳ Сейчас не твой ход!');
+        return;
+    }
+    console.log('📤 Отправляем строку:', text);
+    socket.emit('submit_line', { roomId, text });
+    lineInput.value = '';
+    lineInput.focus();
+}
+
+lineInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendLine();
+    }
+});
+
+sendBtn.addEventListener('click', sendLine);
+
+// =============================================
+// ФИНАЛЬНЫЙ ЭКРАН
+// =============================================
+
+function showFinalScreen(data) {
+    arena.style.display = 'none';
+    finalScreen.className = 'final-screen visible';
+
+    let html = '';
+    data.history.forEach(line => {
+        let className = 'line';
+        if (line.authorId === myId) className += ' you';
+        else if (line.authorId === opponentId) className += ' opponent';
+        else className += ' system';
+        html += `<div class="${className}">${line.text}</div>`;
+    });
+    poemBox.innerHTML = html;
+}
+
+playAgainBtn.addEventListener('click', () => {
+    window.location.href = '/';
+});
 
 // =============================================
 // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // =============================================
 
-function generateRoomId() {
-  return 'room_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+function showNotification(text) {
+    console.log('📢', text);
+    const container = document.getElementById('message-container') || document.body;
+    const msg = document.createElement('div');
+    msg.style.cssText = `
+        position: fixed;
+        bottom: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: #1a1a24;
+        border: 1px solid #8b5cf6;
+        color: #e8e8f0;
+        padding: 10px 20px;
+        border-radius: 12px;
+        font-size: 14px;
+        z-index: 9999;
+        max-width: 90%;
+        text-align: center;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    `;
+    msg.textContent = text;
+    document.body.appendChild(msg);
+    setTimeout(() => {
+        if (msg.parentNode) msg.remove();
+    }, 4000);
 }
 
-function getRandomTheme() {
-  const themes = ['Осень', 'Любовь', 'Роботы', 'Кофе', 'Сон', 'Город', 'Море', 'Космос', 'Дружба', 'Время'];
-  return themes[Math.floor(Math.random() * themes.length)];
-}
-
-// =============================================
-// ПОИСК СОПЕРНИКА
-// =============================================
-
-function tryMatchPlayers() {
-  if (waitingQueue.length < 2) return false;
-
-  const player1 = waitingQueue.shift();
-  const player2 = waitingQueue.shift();
-
-  const roomId = generateRoomId();
-  const theme = getRandomTheme();
-
-  // 🎲 ГЛАВНОЕ ИЗМЕНЕНИЕ: случайный выбор первого хода
-  const firstPlayer = Math.random() < 0.5 ? player1 : player2;
-  const secondPlayer = firstPlayer === player1 ? player2 : player1;
-
-  console.log(`🎲 Первый ход: ${firstPlayer.name}`);
-
-  const gameData = {
-    players: [player1, player2],
-    currentTurn: firstPlayer.id, // ← случайный игрок начинает
-    round: 1,
-    timeLeft: 180,
-    turnTimeLeft: 10,
-    history: [],
-    lastLine: null,
-    theme: theme,
-    isActive: true,
-    interval: null,
-    playerNames: {
-      [player1.id]: player1.name,
-      [player2.id]: player2.name
-    },
-    playerSockets: {
-      [player1.id]: player1.socket,
-      [player2.id]: player2.socket
-    },
-    createdAt: Date.now()
-  };
-
-  activeGames.set(roomId, gameData);
-  console.log(`✅ Игра создана: ${roomId}`);
-  console.log(`   👤 Игрок 1: ${player1.name} (${player1.id})`);
-  console.log(`   👤 Игрок 2: ${player2.name} (${player2.id})`);
-  console.log(`   🎯 Начинает: ${firstPlayer.name}`);
-
-  // Подключаем игроков к комнате
-  player1.socket.join(roomId);
-  player2.socket.join(roomId);
-
-  // Отправляем событие о начале игры
-  io.to(roomId).emit('game_started', {
-    roomId: roomId,
-    opponent: player2.name,
-    theme: theme,
-    round: 1,
-    currentTurn: firstPlayer.id,
-    youAre: firstPlayer === player1 ? 'player1' : 'player2'
-  });
-
-  // Отправляем второму игроку
-  const secondPlayerRole = firstPlayer === player1 ? 'player2' : 'player1';
-  io.to(secondPlayer.socket.id).emit('game_started', {
-    roomId: roomId,
-    opponent: firstPlayer.name,
-    theme: theme,
-    round: 1,
-    currentTurn: firstPlayer.id,
-    youAre: secondPlayerRole
-  });
-
-  // Запускаем игровой цикл
-  startGameLoop(roomId);
-
-  // Отправляем начальное состояние
-  setTimeout(() => {
-    sendGameState(roomId);
-  }, 500);
-
-  return true;
-}
-
-// =============================================
-// ИГРОВОЙ ЦИКЛ
-// =============================================
-
-function startGameLoop(roomId) {
-  const game = activeGames.get(roomId);
-  if (!game) return;
-
-  if (game.interval) {
-    clearInterval(game.interval);
-  }
-
-  game.interval = setInterval(() => {
-    if (!game.isActive) {
-      clearInterval(game.interval);
-      return;
+// Выход из игры
+document.getElementById('exitBtn').addEventListener('click', () => {
+    if (confirm('Точно хочешь выйти из игры?')) {
+        socket.disconnect();
+        window.location.href = '/';
     }
-
-    game.timeLeft--;
-    game.turnTimeLeft--;
-
-    io.to(roomId).emit('game_tick', {
-      timeLeft: game.timeLeft,
-      turnTimeLeft: game.turnTimeLeft,
-      currentTurn: game.currentTurn
-    });
-
-    if (game.turnTimeLeft <= 0) {
-      handleTurnTimeout(roomId);
-    }
-
-    if (game.timeLeft <= 0) {
-      handleRoundEnd(roomId);
-    }
-
-  }, 1000);
-}
-
-// =============================================
-// ОБРАБОТКА ХОДОВ
-// =============================================
-
-function handleTurnTimeout(roomId) {
-  const game = activeGames.get(roomId);
-  if (!game || !game.isActive) return;
-
-  const currentPlayer = game.players.find(p => p.id === game.currentTurn);
-  const opponent = game.players.find(p => p.id !== game.currentTurn);
-
-  if (currentPlayer) {
-    game.history.push({
-      text: `... (${currentPlayer.name} пропустил ход) ...`,
-      author: 'system',
-      authorId: 'system',
-      isSkip: true,
-      timestamp: Date.now()
-    });
-  }
-
-  game.currentTurn = opponent.id;
-  game.turnTimeLeft = 10;
-
-  io.to(roomId).emit('turn_skipped', {
-    message: `${currentPlayer ? currentPlayer.name : 'Игрок'} пропустил ход`,
-    currentTurn: game.currentTurn,
-    turnTimeLeft: game.turnTimeLeft,
-    playerName: currentPlayer ? currentPlayer.name : 'Игрок'
-  });
-
-  sendGameState(roomId);
-}
-
-// =============================================
-// ОТПРАВКА СОСТОЯНИЯ ИГРЫ
-// =============================================
-
-function sendGameState(roomId) {
-  const game = activeGames.get(roomId);
-  if (!game) return;
-
-  game.players.forEach(player => {
-    const opponent = game.players.find(p => p.id !== player.id);
-    io.to(player.id).emit('game_state', {
-      myId: player.id,
-      opponentId: opponent ? opponent.id : null,
-      myName: player.name,
-      opponentName: opponent ? opponent.name : 'Соперник',
-      state: {
-        currentTurn: game.currentTurn,
-        timeLeft: game.timeLeft,
-        turnTimeLeft: game.turnTimeLeft,
-        history: game.history,
-        lastLine: game.lastLine,
-        isActive: game.isActive
-      }
-    });
-  });
-}
-
-// =============================================
-// ОКОНЧАНИЕ РАУНДА
-// =============================================
-
-function handleRoundEnd(roomId) {
-  const game = activeGames.get(roomId);
-  if (!game || !game.isActive) return;
-
-  if (game.round >= 3) {
-    finishGame(roomId);
-    return;
-  }
-
-  game.round++;
-  game.timeLeft = 180;
-  game.turnTimeLeft = 10;
-  game.lastLine = null;
-
-  // Меняем первого ходящего в новом раунде
-  const firstPlayer = game.round % 2 === 0 ? game.players[0] : game.players[1];
-  game.currentTurn = firstPlayer.id;
-
-  const newTheme = getRandomTheme();
-  game.theme = newTheme;
-
-  io.to(roomId).emit('round_start', {
-    round: game.round,
-    theme: newTheme,
-    currentTurn: game.currentTurn,
-    timeLeft: game.timeLeft,
-    turnTimeLeft: game.turnTimeLeft
-  });
-
-  sendGameState(roomId);
-  startGameLoop(roomId);
-}
-
-// =============================================
-// ЗАВЕРШЕНИЕ ИГРЫ
-// =============================================
-
-function finishGame(roomId) {
-  const game = activeGames.get(roomId);
-  if (!game) return;
-
-  game.isActive = false;
-
-  if (game.interval) {
-    clearInterval(game.interval);
-    game.interval = null;
-  }
-
-  const fullPoem = game.history
-    .filter(line => line.author !== 'system')
-    .map(line => line.text)
-    .join('\n');
-
-  io.to(roomId).emit('game_finished', {
-    poem: fullPoem || 'Ни одной строки не было написано 😅',
-    history: game.history,
-    players: game.players.map(p => p.name),
-    rounds: game.round
-  });
-
-  console.log(`🏁 Игра ${roomId} завершена`);
-}
-
-// =============================================
-// ОБРАБОТЧИКИ СОКЕТОВ
-// =============================================
-
-io.on('connection', (socket) => {
-  console.log('🟢 Подключился игрок:', socket.id);
-
-  // ---- ПОИСК ИГРЫ ----
-  socket.on('find_game', (data) => {
-    const playerName = data?.name?.trim() || 'Аноним';
-    console.log(`🔍 Игрок ${playerName} (${socket.id}) ищет игру`);
-
-    const alreadyWaiting = waitingQueue.some(p => p.id === socket.id);
-    if (alreadyWaiting) {
-      socket.emit('error', 'Вы уже в очереди');
-      return;
-    }
-
-    waitingQueue.push({
-      id: socket.id,
-      name: playerName,
-      socket: socket,
-      joinedAt: Date.now()
-    });
-
-    socket.emit('queued', { message: 'Вы в очереди. Ищем соперника...' });
-    tryMatchPlayers();
-  });
-
-  // ---- ВХОД В КОМНАТУ ----
-  socket.on('join_game', (data) => {
-    const { roomId, name } = data;
-    console.log(`👤 Попытка подключения: ${name} (${socket.id}) к комнате ${roomId}`);
-
-    const game = activeGames.get(roomId);
-    if (!game) {
-      console.log(`❌ Игра ${roomId} не найдена`);
-      socket.emit('error', 'Игра не найдена');
-      return;
-    }
-
-    // Ищем игрока по имени
-    const player = game.players.find(p => p.name === name);
-    
-    if (!player) {
-      console.log(`❌ Игрок с именем "${name}" не найден`);
-      socket.emit('error', 'Вы не участник этой игры');
-      return;
-    }
-
-    // Обновляем socket.id для этого игрока
-    const oldId = player.id;
-    player.id = socket.id;
-    player.socket = socket;
-    
-    game.playerSockets[oldId] = socket;
-    delete game.playerSockets[oldId];
-    game.playerSockets[socket.id] = socket;
-
-    console.log(`✅ Игрок ${name} обновил соединение (старый ID: ${oldId})`);
-
-    socket.join(roomId);
-
-    const opponent = game.players.find(p => p.id !== socket.id);
-
-    // Отправляем состояние
-    socket.emit('game_state', {
-      myId: socket.id,
-      opponentId: opponent ? opponent.id : null,
-      myName: name,
-      opponentName: opponent ? opponent.name : 'Соперник',
-      state: {
-        currentTurn: game.currentTurn,
-        timeLeft: game.timeLeft,
-        turnTimeLeft: game.turnTimeLeft,
-        history: game.history,
-        lastLine: game.lastLine,
-        isActive: game.isActive
-      }
-    });
-
-    socket.emit('round_start', {
-      round: game.round,
-      theme: game.theme,
-      currentTurn: game.currentTurn,
-      timeLeft: game.timeLeft,
-      turnTimeLeft: game.turnTimeLeft
-    });
-
-    console.log(`📤 Отправлено состояние для ${name}`);
-    console.log(`   🎯 Текущий ход: ${game.currentTurn === socket.id ? 'ТВОЙ' : 'СОПЕРНИКА'}`);
-  });
-
-  // ---- ОТПРАВКА СТРОКИ ----
-  socket.on('submit_line', (data) => {
-    const { roomId, text } = data;
-    const game = activeGames.get(roomId);
-
-    if (!game || !game.isActive) {
-      socket.emit('error', 'Игра не найдена или завершена');
-      return;
-    }
-
-    if (socket.id !== game.currentTurn) {
-      socket.emit('error', 'Сейчас не твой ход');
-      return;
-    }
-
-    if (!text || text.trim().length === 0) {
-      socket.emit('error', 'Строка не может быть пустой');
-      return;
-    }
-
-    const player = game.players.find(p => p.id === socket.id);
-    const lineData = {
-      text: text.trim(),
-      author: player ? player.name : 'Игрок',
-      authorId: socket.id,
-      timestamp: Date.now()
-    };
-
-    game.history.push(lineData);
-    game.lastLine = text.trim();
-
-    const opponent = game.players.find(p => p.id !== socket.id);
-    game.currentTurn = opponent.id;
-    game.turnTimeLeft = 10;
-
-    io.to(roomId).emit('new_line', {
-      lastLine: game.lastLine,
-      currentTurn: game.currentTurn,
-      turnTimeLeft: game.turnTimeLeft,
-      author: lineData.author,
-      authorId: lineData.authorId
-    });
-
-    io.to(roomId).emit('turn_changed', {
-      currentTurn: game.currentTurn,
-      turnTimeLeft: game.turnTimeLeft
-    });
-
-    console.log(`📝 ${player.name}: "${text}"`);
-  });
-
-  // ---- ОТКЛЮЧЕНИЕ ----
-  socket.on('disconnect', () => {
-    console.log('🔴 Отключился игрок:', socket.id);
-
-    const queueIndex = waitingQueue.findIndex(p => p.id === socket.id);
-    if (queueIndex !== -1) {
-      waitingQueue.splice(queueIndex, 1);
-    }
-
-    for (const [roomId, game] of activeGames) {
-      const playerInGame = game.players.some(p => p.id === socket.id);
-      if (playerInGame) {
-        console.log(`🚪 Игрок вышел из игры ${roomId}`);
-        io.to(roomId).emit('opponent_left', {
-          message: 'Соперник покинул игру'
-        });
-        game.isActive = false;
-        if (game.interval) {
-          clearInterval(game.interval);
-        }
-        break;
-      }
-    }
-  });
 });
 
-// =============================================
-// ЗАПУСК СЕРВЕРА
-// =============================================
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`🚀 Сервер запущен на порту ${PORT}`);
-  console.log(`👥 Ожидаем игроков...`);
-});
+console.log('🎮 Игровой экран загружен!');
+console.log('🔗 Комната:', roomId);
+console.log('👤 Игрок:', playerName);
