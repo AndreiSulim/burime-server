@@ -85,7 +85,7 @@ function tryMatch() {
     round: 1,
     theme,
     timeLeft: 180,
-    turnTimeLeft: 10,
+    turnTimeLeft: 25,
     history: [],
     interval: null,
     isActive: true,
@@ -162,7 +162,7 @@ function handleTurnTimeout(roomId) {
   });
 
   room.currentTurn = opponent;
-  room.turnTimeLeft = 10;
+  room.turnTimeLeft = 25;
   room.lastActivity = now();
 
   io.to(roomId).emit('turn_skipped', {
@@ -183,7 +183,7 @@ function handleRoundEnd(roomId) {
 
   room.round++;
   room.timeLeft = 180;
-  room.turnTimeLeft = 10;
+  room.turnTimeLeft = 25;
   room.theme = getRandomTheme();
   room.currentTurn = room.round % 2 === 1 ? room.players[0] : room.players[1];
   room.lastActivity = now();
