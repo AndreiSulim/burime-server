@@ -23,14 +23,18 @@ const io = new Server(server, {
 // ХРАНИЛИЩА
 // ===============================
 
-// playerId → { playerId, name, socketId, isConnected, roomId }
+// playerId → { playerId, name, socketId, isConnected, roomId, lastSeen, lastLineAt }
 const players = new Map();
 
-// roomId → { players:[playerId1,playerId2], currentTurn, round, timers... }
+// roomId → { players:[playerId1,playerId2], currentTurn, round, theme, timeLeft, turnTimeLeft, history, interval, isActive, lastActivity }
 const games = new Map();
 
-// очередь ожидания: массив playerId
+// очередь ожидания: массив { playerId, joinedAt }
 const waitingQueue = [];
+
+// статистика
+let totalGames = 0;
+let totalLines = 0;
 
 // ===============================
 // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -52,14 +56,21 @@ function getOpponent(room, playerId) {
   return room.players.find(id => id !== playerId);
 }
 
+function now() {
+  return Date.now();
+}
+
 // ===============================
-// МАТЧМЕЙКИНГ
+// МАТЧМЕЙКИНГ (умная очередь)
 // ===============================
 function tryMatch() {
   if (waitingQueue.length < 2) return;
 
-  const p1 = waitingQueue.shift();
-  const p2 = waitingQueue.shift();
+  // сортируем по времени ожидания (старшие — первыми)
+  waitingQueue.sort((a, b) => a.joinedAt - b.joinedAt);
+
+  const p1 = waitingQueue.shift().playerId;
+  const p2 = waitingQueue.shift().playerId;
 
   const roomId = generateRoomId();
   const theme = getRandomTheme();
@@ -77,7 +88,8 @@ function tryMatch() {
     turnTimeLeft: 10,
     history: [],
     interval: null,
-    isActive: true
+    isActive: true,
+    lastActivity: now()
   };
 
   games.set(roomId, room);
@@ -85,7 +97,9 @@ function tryMatch() {
   players.get(p1).roomId = roomId;
   players.get(p2).roomId = roomId;
 
-  // отправляем старт
+  totalGames++;
+  console.log(`🎮 Новая игра ${roomId}. Игроки: ${players.get(p1).name} vs ${players.get(p2).name}`);
+
   [p1, p2].forEach(pid => {
     const pl = players.get(pid);
     if (pl.socketId) {
@@ -117,6 +131,7 @@ function startGameLoop(roomId) {
 
     room.timeLeft--;
     room.turnTimeLeft--;
+    room.lastActivity = now();
 
     io.to(roomId).emit('game_tick', {
       timeLeft: room.timeLeft,
@@ -142,11 +157,13 @@ function handleTurnTimeout(roomId) {
 
   room.history.push({
     text: `... (${players.get(current).name} пропустил ход) ...`,
-    authorId: 'system'
+    authorId: 'system',
+    timestamp: now()
   });
 
   room.currentTurn = opponent;
   room.turnTimeLeft = 10;
+  room.lastActivity = now();
 
   io.to(roomId).emit('turn_skipped', {
     playerName: players.get(current).name,
@@ -169,6 +186,7 @@ function handleRoundEnd(roomId) {
   room.turnTimeLeft = 10;
   room.theme = getRandomTheme();
   room.currentTurn = room.round % 2 === 1 ? room.players[0] : room.players[1];
+  room.lastActivity = now();
 
   io.to(roomId).emit('round_start', {
     round: room.round,
@@ -182,7 +200,7 @@ function handleRoundEnd(roomId) {
 // ===============================
 // КОНЕЦ ИГРЫ
 // ===============================
-function finishGame(roomId) {
+function finishGame(roomId, reason = 'normal') {
   const room = games.get(roomId);
   if (!room) return;
 
@@ -197,11 +215,29 @@ function finishGame(roomId) {
   io.to(roomId).emit('game_finished', {
     poem: poem || 'Ни одной строки не было написано 😅',
     history: room.history,
-    players: room.players.map(pid => players.get(pid).name)
+    players: room.players.map(pid => players.get(pid).name),
+    reason
   });
+
+  console.log(`🏁 Игра ${roomId} завершена. Причина: ${reason}. Строк: ${room.history.length}`);
 
   games.delete(roomId);
 }
+
+// ===============================
+// АВТО-ОЧИСТКА ЗАВИСШИХ ИГР
+// ===============================
+setInterval(() => {
+  const nowTs = now();
+  for (const [roomId, room] of games) {
+    const age = nowTs - room.lastActivity;
+    // если 10 минут нет активности — удаляем
+    if (age > 10 * 60 * 1000) {
+      console.log(`🧹 Автоочистка игры ${roomId} (нет активности 10 минут)`);
+      finishGame(roomId, 'timeout_cleanup');
+    }
+  }
+}, 60 * 1000);
 
 // ===============================
 // СОКЕТЫ
@@ -215,39 +251,50 @@ io.on('connection', socket => {
 
     players.set(playerId, {
       playerId,
-      name,
+      name: name?.trim() || 'Аноним',
       socketId: socket.id,
       isConnected: true,
-      roomId: null
+      roomId: null,
+      lastSeen: now(),
+      lastLineAt: 0
     });
 
-    waitingQueue.push(playerId);
+    waitingQueue.push({ playerId, joinedAt: now() });
 
     socket.emit('queued', { playerId });
 
+    console.log(`🔍 Игрок ${name} (${playerId}) встал в очередь`);
     tryMatch();
   });
 
   // Игрок заходит на game.html
   socket.on('join_game', ({ playerId, roomId }) => {
     const pl = players.get(playerId);
-    if (!pl) return;
+    if (!pl) {
+      socket.emit('error', 'Игрок не найден');
+      return;
+    }
 
     pl.socketId = socket.id;
     pl.isConnected = true;
+    pl.lastSeen = now();
+
+    const room = games.get(roomId);
+    if (!room) {
+      socket.emit('error', 'Игра не найдена');
+      return;
+    }
 
     socket.join(roomId);
 
-    const room = games.get(roomId);
-    if (!room) return;
-
-    const opponent = getOpponent(room, playerId);
+    const opponentId = getOpponent(room, playerId);
+    const opponent = players.get(opponentId);
 
     socket.emit('game_state', {
       playerId,
-      opponentId: opponent,
+      opponentId,
       myName: pl.name,
-      opponentName: players.get(opponent).name,
+      opponentName: opponent.name,
       state: {
         currentTurn: room.currentTurn,
         timeLeft: room.timeLeft,
@@ -257,56 +304,88 @@ io.on('connection', socket => {
         isActive: room.isActive
       }
     });
+
+    console.log(`👤 ${pl.name} (${playerId}) присоединился к игре ${roomId}`);
   });
 
   // Игрок отправляет строку
   socket.on('submit_line', ({ playerId, roomId, text }) => {
+    const pl = players.get(playerId);
     const room = games.get(roomId);
-    if (!room || !room.isActive) return;
 
+    if (!pl || !room || !room.isActive) return;
     if (room.currentTurn !== playerId) return;
 
+    const nowTs = now();
+
+    // анти-спам: не чаще 1 строки в 800 мс
+    if (nowTs - pl.lastLineAt < 800) {
+      socket.emit('error', 'Слишком часто отправляешь строки');
+      return;
+    }
+
+    if (!text || !text.trim()) {
+      socket.emit('error', 'Строка не может быть пустой');
+      return;
+    }
+
+    pl.lastLineAt = nowTs;
+    room.lastActivity = nowTs;
+    totalLines++;
+
+    const cleanText = text.trim();
+
     room.history.push({
-      text: text.trim(),
-      authorId: playerId
+      text: cleanText,
+      authorId: playerId,
+      timestamp: nowTs
     });
 
-    room.lastLine = text.trim();
+    room.lastLine = cleanText;
     room.turnTimeLeft = 10;
 
-    const opponent = getOpponent(room, playerId);
-    room.currentTurn = opponent;
+    const opponentId = getOpponent(room, playerId);
+    room.currentTurn = opponentId;
 
     io.to(roomId).emit('new_line', {
       lastLine: room.lastLine,
       authorId: playerId,
-      author: players.get(playerId).name,
+      author: pl.name,
       currentTurn: room.currentTurn,
       turnTimeLeft: room.turnTimeLeft
     });
+
+    console.log(`✍️ ${pl.name}: "${cleanText}" (игра ${roomId})`);
   });
 
   // Отключение
   socket.on('disconnect', () => {
     console.log('🔴 Отключился сокет:', socket.id);
 
+    // ищем игрока по socketId
     for (const pl of players.values()) {
       if (pl.socketId === socket.id) {
         pl.isConnected = false;
+        pl.lastSeen = now();
 
         const roomId = pl.roomId;
         if (!roomId) return;
 
         const room = games.get(roomId);
-        if (!room) return;
+        if (!room || !room.isActive) return;
 
-        // ждём 5 секунд — если игрок не вернулся, завершаем игру
+        console.log(`🚪 Игрок ${pl.name} временно отключился из игры ${roomId}`);
+
+        // ждём 5 секунд — если не вернулся, завершаем игру
         setTimeout(() => {
           if (!pl.isConnected && room.isActive) {
-            io.to(roomId).emit('opponent_left');
-            finishGame(roomId);
+            console.log(`⏱️ Игрок ${pl.name} не вернулся. Завершаем игру ${roomId}`);
+            io.to(roomId).emit('opponent_left', { name: pl.name });
+            finishGame(roomId, 'player_disconnected');
           }
         }, 5000);
+
+        break;
       }
     }
   });
@@ -318,4 +397,5 @@ io.on('connection', socket => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🚀 Сервер запущен на ${PORT}`);
+  console.log('📊 Статистика будет выводиться в консоль по мере игр');
 });
