@@ -60,14 +60,15 @@ function tryMatchPlayers() {
     isActive: true,
     interval: null,
     roundCount: 1,
-    // НОВОЕ: храним имена для быстрого доступа
     playerNames: {
       [player1.id]: player1.name,
       [player2.id]: player2.name
-    }
+    },
+    createdAt: Date.now()
   };
 
   activeGames.set(roomId, gameData);
+  console.log(`✅ Игра создана: ${roomId}, игроки: ${player1.name} и ${player2.name}`);
 
   // Подключаем игроков к комнате Socket.io
   player1.socket.join(roomId);
@@ -83,7 +84,6 @@ function tryMatchPlayers() {
     youAre: 'player1'
   });
 
-  // Второму игроку
   io.to(player2.socket.id).emit('game_started', {
     roomId: roomId,
     opponent: player1.name,
@@ -120,7 +120,6 @@ function startGameLoop(roomId) {
     game.timeLeft--;
     game.turnTimeLeft--;
 
-    // Отправляем обновление всем в комнате
     io.to(roomId).emit('game_tick', {
       timeLeft: game.timeLeft,
       turnTimeLeft: game.turnTimeLeft,
@@ -166,22 +165,37 @@ function handleTurnTimeout(roomId) {
     message: `${currentPlayer ? currentPlayer.name : 'Игрок'} пропустил ход`,
     currentTurn: game.currentTurn,
     turnTimeLeft: game.turnTimeLeft,
-    playerName: currentPlayer ? currentPlayer.name : 'Игрок' // НОВОЕ: для отображения
+    playerName: currentPlayer ? currentPlayer.name : 'Игрок'
   });
 
-  // НОВОЕ: отправляем обновленное состояние игры
-  io.to(roomId).emit('game_state', {
-    myId: null, // будет заменено на клиенте
-    opponentId: null,
-    myName: '',
-    opponentName: '',
-    state: {
-      currentTurn: game.currentTurn,
-      timeLeft: game.timeLeft,
-      turnTimeLeft: game.turnTimeLeft,
-      history: game.history,
-      lastLine: game.lastLine
-    }
+  // Отправляем обновленное состояние
+  sendGameState(roomId);
+}
+
+// =============================================
+// ОТПРАВКА СОСТОЯНИЯ ИГРЫ
+// =============================================
+
+function sendGameState(roomId) {
+  const game = activeGames.get(roomId);
+  if (!game) return;
+
+  game.players.forEach(player => {
+    const opponent = game.players.find(p => p.id !== player.id);
+    player.socket.emit('game_state', {
+      myId: player.id,
+      opponentId: opponent ? opponent.id : null,
+      myName: player.name,
+      opponentName: opponent ? opponent.name : 'Соперник',
+      state: {
+        currentTurn: game.currentTurn,
+        timeLeft: game.timeLeft,
+        turnTimeLeft: game.turnTimeLeft,
+        history: game.history,
+        lastLine: game.lastLine,
+        isActive: game.isActive
+      }
+    });
   });
 }
 
@@ -217,6 +231,7 @@ function handleRoundEnd(roomId) {
     turnTimeLeft: game.turnTimeLeft
   });
 
+  sendGameState(roomId);
   startGameLoop(roomId);
 }
 
@@ -247,6 +262,8 @@ function finishGame(roomId) {
     rounds: game.round
   });
 
+  // ❌ УДАЛЯЕМ ИГРУ СРАЗУ, ЧТОБЫ НЕ ЗАСОРЯТЬ ПАМЯТЬ
+  // Но даём игрокам время прочитать финал
   setTimeout(() => {
     const gameToDelete = activeGames.get(roomId);
     if (gameToDelete) {
@@ -254,8 +271,9 @@ function finishGame(roomId) {
         p.socket.leave(roomId);
       });
       activeGames.delete(roomId);
+      console.log(`🗑️ Игра ${roomId} удалена`);
     }
-  }, 15000);
+  }, 30000); // 30 секунд на чтение финала
 }
 
 // =============================================
@@ -265,9 +283,10 @@ function finishGame(roomId) {
 io.on('connection', (socket) => {
   console.log('🟢 Подключился игрок:', socket.id);
 
-  // ---- ПОИСК ИГРЫ (было) ----
+  // ---- ПОИСК ИГРЫ ----
   socket.on('find_game', (data) => {
     const playerName = data?.name?.trim() || 'Аноним';
+    console.log(`🔍 Игрок ${playerName} (${socket.id}) ищет игру`);
 
     const alreadyWaiting = waitingQueue.some(p => p.id === socket.id);
     if (alreadyWaiting) {
@@ -286,13 +305,14 @@ io.on('connection', (socket) => {
     tryMatchPlayers();
   });
 
-  // ---- НОВОЕ: ВХОД В КОМНАТУ (для игрового экрана) ----
+  // ---- ВХОД В КОМНАТУ ----
   socket.on('join_game', (data) => {
     const { roomId, name } = data;
     console.log(`👤 Игрок ${name} (${socket.id}) подключается к комнате ${roomId}`);
 
     const game = activeGames.get(roomId);
     if (!game) {
+      console.log(`❌ Игра ${roomId} не найдена`);
       socket.emit('error', 'Игра не найдена');
       return;
     }
@@ -300,17 +320,16 @@ io.on('connection', (socket) => {
     // Проверяем, есть ли игрок в этой комнате
     const player = game.players.find(p => p.id === socket.id);
     if (!player) {
+      console.log(`❌ Игрок ${socket.id} не участник игры ${roomId}`);
       socket.emit('error', 'Вы не участник этой игры');
       return;
     }
 
-    // Подключаем сокет к комнате (если ещё не подключён)
     socket.join(roomId);
+    console.log(`✅ Игрок ${name} подключился к игре ${roomId}`);
 
-    // Находим оппонента
+    // Отправляем состояние игры
     const opponent = game.players.find(p => p.id !== socket.id);
-
-    // Отправляем текущее состояние игры
     socket.emit('game_state', {
       myId: socket.id,
       opponentId: opponent ? opponent.id : null,
@@ -321,11 +340,12 @@ io.on('connection', (socket) => {
         timeLeft: game.timeLeft,
         turnTimeLeft: game.turnTimeLeft,
         history: game.history,
-        lastLine: game.lastLine
+        lastLine: game.lastLine,
+        isActive: game.isActive
       }
     });
 
-    // Если игра уже активна, отправляем текущую тему и раунд
+    // Отправляем тему и раунд
     socket.emit('round_start', {
       round: game.round,
       theme: game.theme,
@@ -333,11 +353,9 @@ io.on('connection', (socket) => {
       timeLeft: game.timeLeft,
       turnTimeLeft: game.turnTimeLeft
     });
-
-    console.log(`✅ Игрок ${name} подключился к игре ${roomId}`);
   });
 
-  // ---- ОТПРАВКА СТРОКИ (было, но с небольшими улучшениями) ----
+  // ---- ОТПРАВКА СТРОКИ ----
   socket.on('submit_line', (data) => {
     const { roomId, text } = data;
     const game = activeGames.get(roomId);
@@ -372,7 +390,6 @@ io.on('connection', (socket) => {
     game.currentTurn = opponent.id;
     game.turnTimeLeft = 10;
 
-    // Отправляем новую строку ВСЕМ в комнате
     io.to(roomId).emit('new_line', {
       lastLine: game.lastLine,
       currentTurn: game.currentTurn,
@@ -381,7 +398,6 @@ io.on('connection', (socket) => {
       authorId: lineData.authorId
     });
 
-    // НОВОЕ: отправляем обновление о смене хода
     io.to(roomId).emit('turn_changed', {
       currentTurn: game.currentTurn,
       turnTimeLeft: game.turnTimeLeft
@@ -407,7 +423,9 @@ io.on('connection', (socket) => {
         if (game.interval) {
           clearInterval(game.interval);
         }
+        // Удаляем игру сразу, чтобы не ждать
         activeGames.delete(roomId);
+        console.log(`🗑️ Игра ${roomId} удалена (игрок вышел)`);
         break;
       }
     }
@@ -422,4 +440,5 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🚀 Сервер запущен на порту ${PORT}`);
   console.log(`👥 Ожидаем игроков...`);
+  console.log(`📋 Активных игр: ${activeGames.size}`);
 });
